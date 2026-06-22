@@ -132,13 +132,13 @@ def step1_parse_brief(brief: str, retries: int = 3) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Step 2 — Pipeline API: submit job                                            #
 # --------------------------------------------------------------------------- #
-def step2_submit_job(creative: dict[str, Any]) -> str:
+def step2_submit_job(creative: dict[str, Any], mode: str = "quality") -> str:
     body = {
         "prompt": creative["prompt"],
         "character_note": creative.get("character_note", ""),
         "total_duration_seconds": creative.get("total_duration_seconds", 30),
         "animation": creative.get("animation", "auto"),
-        "mode": "quality",
+        "mode": mode,
     }
     resp = requests.post(f"{HVP_URL}/generate-sequence", json=body, timeout=30)
     resp.raise_for_status()
@@ -192,6 +192,7 @@ def run(
     brief: str,
     chat_id: str | int | None = None,
     on_progress: Callable[[str], None] | None = None,
+    mode: str = "quality",
 ) -> dict[str, Any]:
     log = on_progress or (lambda m: print(f"[orchestrate] {m}", file=sys.stderr, flush=True))
 
@@ -206,7 +207,7 @@ def run(
     log("step 2/4 — ejecting LM Studio model to free VRAM for render...")
     _lm_eject()
     log("  submitting to pipeline API...")
-    job_id = step2_submit_job(creative)
+    job_id = step2_submit_job(creative, mode=mode)
     log(f"  job_id: {job_id}")
 
     log("step 3/4 — rendering (15-60 min on RTX 3090)...")
@@ -240,6 +241,7 @@ _pj_lock = threading.Lock()
 class VideoRequest(BaseModel):
     brief: str
     chat_id: Optional[str] = None
+    mode: str = "quality"  # test | standard | quality
 
 
 class PipelineJobInfo(BaseModel):
@@ -258,7 +260,7 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _run_pipeline(pj_id: str, brief: str, chat_id: str | None) -> None:
+def _run_pipeline(pj_id: str, brief: str, chat_id: str | None, mode: str = "quality") -> None:
     logs: list[str] = []
 
     def _log(msg: str) -> None:
@@ -267,7 +269,7 @@ def _run_pipeline(pj_id: str, brief: str, chat_id: str | None) -> None:
             _pipeline_jobs[pj_id]["logs"] = logs
 
     try:
-        result = run(brief, chat_id=chat_id, on_progress=_log)
+        result = run(brief, chat_id=chat_id, on_progress=_log, mode=mode)
         with _pj_lock:
             _pipeline_jobs[pj_id].update({
                 "status": "completed",
@@ -343,7 +345,7 @@ def generate_video(req: VideoRequest) -> dict[str, Any]:
             "errors": [],
             "logs": [],
         }
-    t = threading.Thread(target=_run_pipeline, args=(pj_id, req.brief, req.chat_id), daemon=True)
+    t = threading.Thread(target=_run_pipeline, args=(pj_id, req.brief, req.chat_id, req.mode), daemon=True)
     t.start()
     return {"id": pj_id, "status": "running"}
 
