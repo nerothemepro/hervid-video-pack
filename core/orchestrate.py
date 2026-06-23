@@ -42,7 +42,7 @@ from pydantic import BaseModel
 # Config                                                                       #
 # --------------------------------------------------------------------------- #
 LM_URL = os.environ.get("LM_STUDIO_BASE_URL", "http://host.docker.internal:1234/v1")
-LM_MODEL = os.environ.get("LM_MODEL", "gemma-4-12b-qat")
+LM_MODEL = os.environ.get("LM_MODEL", "google/gemma-4-12b-qat")
 # LM Studio management API (not /v1 — separate port/path)
 LM_MGMT = LM_URL.replace("/v1", "")  # http://host.docker.internal:1234
 HVP_URL = os.environ.get("HVP_API_URL", "http://localhost:8500")
@@ -70,7 +70,10 @@ def _lm_load() -> None:
     try:
         info = requests.get(f"{LM_MGMT}/api/v1/models", timeout=10).json()
         for m in info.get("models", []):
-            if m.get("key") == LM_MODEL and m.get("loaded_instances"):
+            # Match on key suffix to handle "google/gemma-4-12b-qat" vs "gemma-4-12b-qat"
+            key = m.get("key", "")
+            if (key == LM_MODEL or key.endswith("/" + LM_MODEL) or LM_MODEL.endswith("/" + key)) \
+                    and m.get("loaded_instances"):
                 return  # already loaded
         requests.post(f"{LM_MGMT}/api/v1/models/load", json={"model": LM_MODEL}, timeout=120).raise_for_status()
     except Exception as e:
@@ -105,13 +108,15 @@ def step1_parse_brief(brief: str, retries: int = 3) -> dict[str, Any]:
     }
     last_err: Exception | None = None
     text = ""
+    # Backoff schedule: 15s, 30s, 60s, 90s — long enough for Hermes curator to release LM Studio
+    _backoffs = [15, 30, 60, 90]
     for attempt in range(retries):
         try:
             resp = requests.post(f"{LM_URL}/chat/completions", json=payload, timeout=90)
             resp.raise_for_status()
             data = resp.json()
 
-            # LM Studio returns error dict (e.g. model busy/not loaded) instead of choices
+            # LM Studio returns error dict (e.g. model busy with another caller) instead of choices
             if "error" in data:
                 raise ValueError(f"LM Studio returned error: {data['error']}")
             if not data.get("choices"):
@@ -143,7 +148,7 @@ def step1_parse_brief(brief: str, retries: int = 3) -> dict[str, Any]:
         except (requests.RequestException, ValueError, json.JSONDecodeError, KeyError) as e:
             last_err = e
             if attempt < retries - 1:
-                wait = 10 * (attempt + 1)  # 10s, 20s backoff
+                wait = _backoffs[min(attempt, len(_backoffs) - 1)]
                 print(f"[orchestrate] step1 attempt {attempt+1}/{retries} failed: {e} — retrying in {wait}s",
                       file=sys.stderr, flush=True)
                 time.sleep(wait)
