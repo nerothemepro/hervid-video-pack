@@ -104,15 +104,33 @@ def step1_parse_brief(brief: str, retries: int = 3) -> dict[str, Any]:
         "max_tokens": 800,  # gemma-4-12b needs headroom for reasoning before JSON output
     }
     last_err: Exception | None = None
+    text = ""
     for attempt in range(retries):
-        resp = requests.post(f"{LM_URL}/chat/completions", json=payload, timeout=90)
-        resp.raise_for_status()
-        text = resp.json()["choices"][0]["message"]["content"].strip()
-        # Strip markdown fences if model added them
-        if text.startswith("```"):
-            text = "\n".join(text.split("\n")[1:])
-            text = text.rsplit("```", 1)[0].strip()
         try:
+            resp = requests.post(f"{LM_URL}/chat/completions", json=payload, timeout=90)
+            resp.raise_for_status()
+            data = resp.json()
+
+            # LM Studio returns error dict (e.g. model busy/not loaded) instead of choices
+            if "error" in data:
+                raise ValueError(f"LM Studio returned error: {data['error']}")
+            if not data.get("choices"):
+                raise ValueError(f"LM Studio response missing 'choices' — raw: {str(data)[:200]}")
+
+            msg = data["choices"][0]["message"]
+            # gemma-4-12b-qat: answer in 'content', thinking in 'reasoning_content'
+            text = (msg.get("content") or "").strip()
+            if not text:
+                # Fallback: reasoning_content sometimes carries the final output
+                text = (msg.get("reasoning_content") or "").strip()
+            if not text:
+                raise ValueError("LM Studio returned empty content (token budget exhausted in thinking phase?)")
+
+            # Strip markdown fences if model added them
+            if text.startswith("```"):
+                text = "\n".join(text.split("\n")[1:])
+                text = text.rsplit("```", 1)[0].strip()
+
             parsed = json.loads(text)
             if "prompt" not in parsed:
                 raise ValueError("missing 'prompt' field")
@@ -121,10 +139,17 @@ def step1_parse_brief(brief: str, retries: int = 3) -> dict[str, Any]:
             parsed.setdefault("animation", "auto")
             parsed["total_duration_seconds"] = max(6, min(60, int(parsed["total_duration_seconds"])))
             return parsed
-        except (json.JSONDecodeError, ValueError, KeyError) as e:
+
+        except (requests.RequestException, ValueError, json.JSONDecodeError, KeyError) as e:
             last_err = e
+            if attempt < retries - 1:
+                wait = 10 * (attempt + 1)  # 10s, 20s backoff
+                print(f"[orchestrate] step1 attempt {attempt+1}/{retries} failed: {e} — retrying in {wait}s",
+                      file=sys.stderr, flush=True)
+                time.sleep(wait)
+
     raise RuntimeError(
-        f"LM Studio returned unparseable JSON after {retries} attempts. "
+        f"step1_parse_brief failed after {retries} attempts. "
         f"Last error: {last_err}. Last text: {text!r}"
     )
 
