@@ -101,7 +101,7 @@ def step1_parse_brief(brief: str, retries: int = 3) -> dict[str, Any]:
             {"role": "user", "content": brief},
         ],
         "temperature": 0.3,
-        "max_tokens": 800,  # gemma-4-12b needs headroom for reasoning before JSON output
+        "max_tokens": 1200,  # gemma-4-12b: ~800 for thinking phase + ~400 for JSON output
     }
     last_err: Exception | None = None
     text = ""
