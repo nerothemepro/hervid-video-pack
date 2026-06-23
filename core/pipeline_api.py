@@ -81,6 +81,7 @@ class SequenceRequest(BaseModel):
     seed: Optional[int] = Field(None, ge=0, le=2147483647)
     # Optional creative-but-safe overrides
     steps: Optional[int] = Field(None, ge=1, le=30)
+    skip_face_restore: bool = Field(False, description="Disable CodeFormer face restore (set for animal content)")
 
 
 class JobInfo(BaseModel):
@@ -148,6 +149,11 @@ def _run_job(job_id: str) -> None:
     _set(job_id, status=JobStatus.running.value, started_at=_now(), queue_position=None)
     started = time.time()
     tail: deque[str] = deque(maxlen=STDERR_TAIL_LINES)
+    # Build subprocess env — override LTX_FACE_RESTORE for animal content
+    proc_env = None
+    if req.skip_face_restore:
+        import os as _os
+        proc_env = {**_os.environ, "LTX_FACE_RESTORE": "0"}
     try:
         proc = subprocess.Popen(
             cmd,
@@ -155,6 +161,7 @@ def _run_job(job_id: str) -> None:
             stderr=subprocess.PIPE,
             text=True,
             cwd=str(Path(SCRIPT_PATH).parent),
+            env=proc_env,
         )
         # Drain stderr live so we keep a useful tail for debugging.
         def _drain() -> None:

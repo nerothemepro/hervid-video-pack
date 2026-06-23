@@ -54,8 +54,8 @@ PORT = int(os.environ.get("HVO_PORT", "8501"))
 
 _LM_SYSTEM = """\
 You are a video production assistant. Given a user brief in any language, extract creative elements and return ONLY a valid JSON object with exactly these fields:
-- "prompt": vivid English description of what happens in the video (1-3 sentences, present tense, specific actions and setting). Include sharp facial detail descriptors: "sharp eyes", "detailed face", "expressive snout/muzzle" for animals; "sharp facial features" for humans.
-- "character_note": English description of the main character or subject appearance for visual consistency across all shots. Always include face/head detail: fur/skin texture, eye color, nose shape, ear shape. Example: "small red fox, pointed black ears, amber eyes, white muzzle, fluffy tail with white tip, sharp detailed face"
+- "prompt": vivid English description of what happens in the video (1-3 sentences, present tense, specific actions and setting). Focus on the scene, action, and environment first. Example for "fox running in forest": "A small red fox sprints through a vibrant autumn forest, leaping over fallen leaves, sunlight filtering through the canopy."
+- "character_note": English description of the main character or subject appearance for visual consistency. Include species, colors, textures, and distinctive features. Example: "small red fox, pointed black ears, amber eyes, white muzzle, fluffy tail with white tip"
 - "total_duration_seconds": integer 6-30 (default 10 for test/short requests, 20-30 for full videos)
 - "animation": "on" if 3D-animated/cartoon/Pixar-style content, "off" if live-action/realistic/documentary, "auto" if uncertain
 
@@ -162,21 +162,37 @@ def step1_parse_brief(brief: str, retries: int = 3) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Step 2 — Pipeline API: submit job                                            #
 # --------------------------------------------------------------------------- #
-_FACE_DETAIL_SUFFIX = ", sharp detailed face, high-frequency facial detail, in-focus features"
+_FACE_DETAIL_SUFFIX = ", sharp detailed face, in-focus features"
+
+# CodeFormer is trained on human faces and produces artifacts (color blotches, muzzle
+# distortion) when applied to animal content. Skip it when character_note is animal.
+_ANIMAL_KEYWORDS = {
+    "fox", "bear", "wolf", "dog", "cat", "tiger", "lion", "elephant", "deer",
+    "rabbit", "bird", "eagle", "owl", "horse", "panda", "raccoon", "squirrel",
+}
+
+def _is_animal_content(character_note: str) -> bool:
+    note_lower = character_note.lower()
+    return any(kw in note_lower for kw in _ANIMAL_KEYWORDS)
+
 
 def step2_submit_job(creative: dict[str, Any], mode: str = "quality") -> str:
     prompt = creative["prompt"]
-    # Append face-detail tokens if not already present — LTX softens faces during motion;
-    # these tokens steer the denoiser to maintain high-frequency detail on the face/head.
+    character_note = creative.get("character_note", "")
+    # Append face-detail tokens if not already present
     if "sharp" not in prompt.lower() and "detail" not in prompt.lower():
         prompt = prompt.rstrip(". ") + _FACE_DETAIL_SUFFIX
     body = {
         "prompt": prompt,
-        "character_note": creative.get("character_note", ""),
+        "character_note": character_note,
         "total_duration_seconds": creative.get("total_duration_seconds", 30),
         "animation": creative.get("animation", "auto"),
         "mode": mode,
     }
+    # CodeFormer creates muzzle/snout artifacts on animal faces (not trained for animals).
+    # Signal pipeline_api to disable face restore for this job.
+    if _is_animal_content(character_note):
+        body["skip_face_restore"] = True
     resp = requests.post(f"{HVP_URL}/generate-sequence", json=body, timeout=30)
     resp.raise_for_status()
     return resp.json()["id"]
