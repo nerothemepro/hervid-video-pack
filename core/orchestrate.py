@@ -285,16 +285,51 @@ def run(
 
 
 # --------------------------------------------------------------------------- #
+# Alternate entry point: skip LM, use pre-computed creative (from preview)    #
+# --------------------------------------------------------------------------- #
+def run_from_creative(
+    creative: dict[str, Any],
+    chat_id: str | int | None = None,
+    on_progress: Callable[[str], None] | None = None,
+    mode: str = "quality",
+) -> dict[str, Any]:
+    """Like run() but skips the LM step — creative JSON is already parsed."""
+    log = on_progress or (lambda m: print(f"[orchestrate] {m}", file=sys.stderr, flush=True))
+    log("step 2/4 — submitting to pipeline API (keyframe pre-approved)...")
+    _lm_eject()  # LM may have been loaded earlier; free VRAM before render
+    job_id = step2_submit_job(creative, mode=mode)
+    log(f"  job_id: {job_id}")
+    log("step 3/4 — rendering...")
+    job = step3_poll(job_id, on_status=lambda s: log(f"  render status → {s}"))
+    if job["status"] != "completed":
+        errors = job.get("errors") or job.get("stderr_tail", [])[-3:]
+        raise RuntimeError(f"render failed — errors: {errors}")
+    video_path = job["final_video_path"]
+    log(f"  done: {video_path}  ({job.get('runtime_seconds', '?')}s)")
+    if chat_id and TG_TOKEN:
+        log("step 4/4 — sending to Telegram...")
+        step4_telegram(chat_id, video_path, caption=f"🎬 {creative['prompt'][:200]}")
+        log("  sent!")
+    return {**job, "_creative": creative}
+
+
+# --------------------------------------------------------------------------- #
 # Service API                                                                  #
 # --------------------------------------------------------------------------- #
 _pipeline_jobs: dict[str, dict[str, Any]] = {}
 _pj_lock = threading.Lock()
+
+# Preview store: {preview_id → {creative, mode}} — persists across turns so
+# the AI can reference a keyframe by ID after the user approves it.
+_preview_store: dict[str, dict[str, Any]] = {}
+_preview_lock = threading.Lock()
 
 
 class VideoRequest(BaseModel):
     brief: str
     chat_id: Optional[str] = None
     mode: str = "quality"  # test | standard | quality
+    preview_id: Optional[str] = None  # if set, skip LM step and use stored creative
 
 
 class PipelineJobInfo(BaseModel):
@@ -313,7 +348,8 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _run_pipeline(pj_id: str, brief: str, chat_id: str | None, mode: str = "quality") -> None:
+def _run_pipeline(pj_id: str, brief: str, chat_id: str | None, mode: str = "quality",
+                  preview_id: str | None = None) -> None:
     logs: list[str] = []
 
     def _log(msg: str) -> None:
@@ -322,7 +358,16 @@ def _run_pipeline(pj_id: str, brief: str, chat_id: str | None, mode: str = "qual
             _pipeline_jobs[pj_id]["logs"] = logs
 
     try:
-        result = run(brief, chat_id=chat_id, on_progress=_log, mode=mode)
+        if preview_id:
+            with _preview_lock:
+                stored = _preview_store.get(preview_id)
+            if not stored:
+                raise RuntimeError(f"preview_id '{preview_id}' not found or expired")
+            creative = stored["creative"]
+            mode = stored.get("mode", mode)
+            result = run_from_creative(creative, chat_id=chat_id, on_progress=_log, mode=mode)
+        else:
+            result = run(brief, chat_id=chat_id, on_progress=_log, mode=mode)
         with _pj_lock:
             _pipeline_jobs[pj_id].update({
                 "status": "completed",
@@ -354,7 +399,7 @@ def root() -> dict[str, Any]:
         "pipeline_api": HVP_URL,
         "lm_studio": LM_URL,
         "lm_model": LM_MODEL,
-        "endpoints": ["/generate-video", "/pipeline-job/{id}", "/pipeline-jobs", "/health"],
+        "endpoints": ["/generate-video", "/generate-preview", "/pipeline-job/{id}", "/pipeline-jobs", "/health"],
     }
 
 
@@ -398,9 +443,80 @@ def generate_video(req: VideoRequest) -> dict[str, Any]:
             "errors": [],
             "logs": [],
         }
-    t = threading.Thread(target=_run_pipeline, args=(pj_id, req.brief, req.chat_id, req.mode), daemon=True)
+    t = threading.Thread(
+        target=_run_pipeline,
+        args=(pj_id, req.brief, req.chat_id, req.mode, req.preview_id),
+        daemon=True,
+    )
     t.start()
     return {"id": pj_id, "status": "running"}
+
+
+class PreviewRequest(BaseModel):
+    brief: str
+    mode: str = "quality"  # test | standard | quality
+
+
+@app.post("/generate-preview")
+def generate_preview(req: PreviewRequest) -> dict[str, Any]:
+    """Step 1+keyframe: parse brief → creative JSON → render Flux keyframe → return image."""
+    log = lambda m: print(f"[orchestrate/preview] {m}", file=sys.stderr, flush=True)
+
+    log("loading LM model...")
+    _lm_load()
+    try:
+        creative = step1_parse_brief(req.brief)
+    finally:
+        _lm_eject()
+
+    log(f"parsed: {creative['prompt'][:80]}")
+
+    # Submit a keyframe-only job to pipeline_api
+    prompt = creative["prompt"]
+    if "sharp" not in prompt.lower() and "detail" not in prompt.lower():
+        prompt = prompt.rstrip(". ") + _FACE_DETAIL_SUFFIX
+
+    body = {
+        "prompt": prompt,
+        "character_note": creative.get("character_note", ""),
+        "animation": creative.get("animation", "auto"),
+        "mode": "test" if req.mode == "test" else "quality",
+        "keyframe_only": True,
+        "skip_face_restore": _is_animal_content(creative.get("character_note", "")),
+    }
+    resp = requests.post(f"{HVP_URL}/generate-sequence", json=body, timeout=30)
+    resp.raise_for_status()
+    kf_job_id = resp.json()["id"]
+    log(f"keyframe job: {kf_job_id}")
+
+    # Poll until done (keyframe is fast: ~30-90s)
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        r = requests.get(f"{HVP_URL}/job/{kf_job_id}", timeout=15)
+        r.raise_for_status()
+        job = r.json()
+        if job["status"] == "completed":
+            image_path = job.get("image_path")
+            if not image_path:
+                raise RuntimeError(f"keyframe job completed but no image_path: {job}")
+            # Store creative so generate-video can reuse it
+            preview_id = str(uuid.uuid4())
+            with _preview_lock:
+                _preview_store[preview_id] = {"creative": creative, "mode": req.mode}
+            log(f"keyframe done: {image_path} → preview_id={preview_id}")
+            return {
+                "preview_id": preview_id,
+                "image_path": image_path,
+                "prompt": creative["prompt"],
+                "character_note": creative.get("character_note", ""),
+                "mode": req.mode,
+            }
+        if job["status"] == "failed":
+            errs = job.get("errors") or job.get("stderr_tail", [])[-3:]
+            raise RuntimeError(f"keyframe render failed: {errs}")
+        time.sleep(10)
+
+    raise TimeoutError(f"keyframe job {kf_job_id} did not complete within 300s")
 
 
 @app.get("/pipeline-job/{pj_id}")

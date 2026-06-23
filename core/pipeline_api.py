@@ -47,6 +47,10 @@ SCRIPT_PATH = os.environ.get(
     "HVP_SCRIPT_PATH",
     "/workspace/projects/media-pipeline/generate_ltx_video_sequence.py",
 )
+KEYFRAME_SCRIPT = os.environ.get(
+    "HVP_KEYFRAME_SCRIPT",
+    "/workspace/projects/media-pipeline/generate_video.py",
+)
 ENV_FILE = os.environ.get("HVP_ENV_FILE", "/opt/data/hermes/media-pipeline.env")
 OUTPUT_DIR = os.environ.get("HVP_OUTPUT_DIR", "/opt/data/hermes/generated-videos")
 COMFY_URL = os.environ.get("HVP_COMFY_URL", "http://host.docker.internal:8188")
@@ -82,6 +86,7 @@ class SequenceRequest(BaseModel):
     # Optional creative-but-safe overrides
     steps: Optional[int] = Field(None, ge=1, le=30)
     skip_face_restore: bool = Field(False, description="Disable CodeFormer face restore (set for animal content)")
+    keyframe_only: bool = Field(False, description="Generate just the Flux keyframe image; skip LTX I2V render")
 
 
 class JobInfo(BaseModel):
@@ -92,6 +97,7 @@ class JobInfo(BaseModel):
     finished_at: Optional[str] = None
     queue_position: Optional[int] = None
     final_video_path: Optional[str] = None
+    image_path: Optional[str] = None
     manifest_path: Optional[str] = None
     runtime_seconds: Optional[float] = None
     errors: list[str] = []
@@ -143,9 +149,38 @@ def _build_command(req: SequenceRequest) -> list[str]:
     return cmd
 
 
+def _build_keyframe_command(req: SequenceRequest) -> list[str]:
+    """Build a generate_video.py --keyframe-only command for preview generation."""
+    # Resolution and steps vary by mode: test is fast/low-res, quality is full-res.
+    if req.mode == "test":
+        kw, kh, flux_steps = 768, 512, 8
+    else:
+        kw, kh, flux_steps = 1152, 768, 28
+    full_prompt = req.prompt
+    if req.character_note:
+        full_prompt = f"{full_prompt}, {req.character_note}"
+    cmd = [
+        PYTHON_BIN,
+        KEYFRAME_SCRIPT,
+        "--prompt", full_prompt,
+        "--keyframe-only",
+        "--keyframe-engine", "flux",
+        "--keyframe-frame-mode", "single_scene",
+        "--keyframe-width", str(kw),
+        "--keyframe-height", str(kh),
+        "--flux-steps", str(flux_steps),
+    ]
+    if req.seed is not None:
+        cmd += ["--seed", str(req.seed)]
+    if Path(ENV_FILE).exists():
+        cmd += ["--env-file", ENV_FILE]
+    return cmd
+
+
 def _run_job(job_id: str) -> None:
     req = SequenceRequest(**_jobs[job_id]["request"])
-    cmd = _build_command(req)
+    is_keyframe = req.keyframe_only
+    cmd = _build_keyframe_command(req) if is_keyframe else _build_command(req)
     _set(job_id, status=JobStatus.running.value, started_at=_now(), queue_position=None)
     started = time.time()
     tail: deque[str] = deque(maxlen=STDERR_TAIL_LINES)
@@ -154,13 +189,14 @@ def _run_job(job_id: str) -> None:
     if req.skip_face_restore:
         import os as _os
         proc_env = {**_os.environ, "LTX_FACE_RESTORE": "0"}
+    script_dir = str(Path(KEYFRAME_SCRIPT if is_keyframe else SCRIPT_PATH).parent)
     try:
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            cwd=str(Path(SCRIPT_PATH).parent),
+            cwd=script_dir,
             env=proc_env,
         )
         # Drain stderr live so we keep a useful tail for debugging.
@@ -200,6 +236,7 @@ def _run_job(job_id: str) -> None:
             finished_at=_now(),
             runtime_seconds=payload.get("runtime_seconds") or round(time.time() - started, 1),
             final_video_path=payload.get("final_video_path"),
+            image_path=payload.get("image_path") or payload.get("start_keyframe_path"),
             manifest_path=payload.get("manifest_path"),
             errors=payload.get("errors") or ([] if ok else [f"exit code {proc.returncode}"]),
             warnings=payload.get("warnings") or [],
@@ -312,6 +349,7 @@ def generate_sequence(req: SequenceRequest, validate_only: bool = False) -> JobI
             "finished_at": None,
             "queue_position": None,
             "final_video_path": None,
+            "image_path": None,
             "manifest_path": None,
             "runtime_seconds": None,
             "errors": [],
