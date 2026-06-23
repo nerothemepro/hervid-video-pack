@@ -54,9 +54,9 @@ PORT = int(os.environ.get("HVO_PORT", "8501"))
 
 _LM_SYSTEM = """\
 You are a video production assistant. Given a user brief in any language, extract creative elements and return ONLY a valid JSON object with exactly these fields:
-- "prompt": vivid English description of what happens in the video (1-3 sentences, present tense, specific actions and setting)
-- "character_note": English description of the main character or subject appearance for visual consistency across all shots (e.g. "orange-brown bear cub, red bib, round eyes, 3D Pixar style")
-- "total_duration_seconds": integer 6-60, estimated duration (default 30)
+- "prompt": vivid English description of what happens in the video (1-3 sentences, present tense, specific actions and setting). Include sharp facial detail descriptors: "sharp eyes", "detailed face", "expressive snout/muzzle" for animals; "sharp facial features" for humans.
+- "character_note": English description of the main character or subject appearance for visual consistency across all shots. Always include face/head detail: fur/skin texture, eye color, nose shape, ear shape. Example: "small red fox, pointed black ears, amber eyes, white muzzle, fluffy tail with white tip, sharp detailed face"
+- "total_duration_seconds": integer 6-30 (default 10 for test/short requests, 20-30 for full videos)
 - "animation": "on" if 3D-animated/cartoon/Pixar-style content, "off" if live-action/realistic/documentary, "auto" if uncertain
 
 Rules: output ONLY the JSON object, no explanation, no markdown fences."""
@@ -162,9 +162,16 @@ def step1_parse_brief(brief: str, retries: int = 3) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Step 2 — Pipeline API: submit job                                            #
 # --------------------------------------------------------------------------- #
+_FACE_DETAIL_SUFFIX = ", sharp detailed face, high-frequency facial detail, in-focus features"
+
 def step2_submit_job(creative: dict[str, Any], mode: str = "quality") -> str:
+    prompt = creative["prompt"]
+    # Append face-detail tokens if not already present — LTX softens faces during motion;
+    # these tokens steer the denoiser to maintain high-frequency detail on the face/head.
+    if "sharp" not in prompt.lower() and "detail" not in prompt.lower():
+        prompt = prompt.rstrip(". ") + _FACE_DETAIL_SUFFIX
     body = {
-        "prompt": creative["prompt"],
+        "prompt": prompt,
         "character_note": creative.get("character_note", ""),
         "total_duration_seconds": creative.get("total_duration_seconds", 30),
         "animation": creative.get("animation", "auto"),
