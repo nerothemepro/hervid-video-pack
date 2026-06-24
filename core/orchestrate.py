@@ -390,6 +390,16 @@ def _run_pipeline(pj_id: str, brief: str, chat_id: str | None, mode: str = "qual
 
 app = FastAPI(title="HerVid Orchestrator", version="1.0.0")
 
+import traceback as _traceback
+from fastapi import Request as _Request
+from fastapi.responses import JSONResponse as _JSONResponse
+
+@app.exception_handler(Exception)
+async def _debug_exception_handler(request: _Request, exc: Exception):
+    tb = _traceback.format_exc()
+    print(f"[orchestrate/ERROR] {type(exc).__name__}: {exc}\n{tb}", file=sys.stderr, flush=True)
+    return _JSONResponse(status_code=500, content={"error": str(exc), "type": type(exc).__name__, "traceback": tb})
+
 
 @app.get("/")
 def root() -> dict[str, Any]:
